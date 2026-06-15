@@ -19,6 +19,7 @@
 #include <CGAL/Search_traits_3.h>
 #include <CGAL/Search_traits_adapter.h>
 #include <CGAL/Orthogonal_k_neighbor_search.h>
+#include <CGAL/Point_set_3.h>
 
 #ifdef CGAL_LINKED_WITH_TBB
 #include <tbb/parallel_for_each.h>
@@ -50,6 +51,7 @@ private:
   Point_range& m_points;
   Point_map m_point_map;
   Normal_map m_normal_map;
+  std::vector<std::uint32_t> m_simplified;
   std::vector<std::array<Vector_3, 3>> m_eigen_vectors;
   std::vector<std::array<FT, 3>> m_eigen_values;
   Tree m_tree;
@@ -108,6 +110,33 @@ public:
     }
   }
 
+  void simplify(FT density) {
+    CGAL_assertion(m_eigen_values.size() != m_points.size());
+    if (m_eigen_values.size() != m_points.size())
+      return;
+
+    std::vector<bool> skip(m_points.size(), false);
+    m_simplified.clear();
+    m_simplified.reserve(m_points.size());
+
+    for (auto idx : m_points) {
+      if (skip[idx])
+        continue;
+      m_simplified.push_back(idx);
+      const Point_3 &p = get(m_point_map, idx);
+      Knn search(m_tree, p, 50);
+      for (typename Knn::iterator it = search.begin() + 1; it != search.end(); ++it) {
+        Vector_3 d = get(m_point_map, it->first) - p;
+
+        for (int i = 0; i < 3; i++)
+          if (CGAL::abs(d * m_eigen_vectors[idx][i]) > density * m_eigen_values[idx][i]) {
+            skip[it->first] = true;
+            break;
+          }
+      }
+    }
+  }
+
 private:
   template<typename DiagonalizeTraits>
   void pca(const std::vector<Point_3> &pts, const Point_3 &mean, std::array<FT, 3> &eigen_values, std::array<Vector_3, 3> &eigen_vectors) {
@@ -126,15 +155,12 @@ private:
 
     DiagonalizeTraits::diagonalize_selfadjoint_covariance_matrix(covariance, eigen_values, evectors);
 
-    swap(eigen_values[0], eigen_values[2]);
-
     for (int i = 0;i<3;i++)
       if (eigen_values[i] < 0.0000001 || eigen_values[i] != eigen_values[i])
         eigen_values[i] = 0.0000001;
 
-    eigen_vectors[0] = Vector_3(evectors[6], evectors[7], evectors[8]);
-    eigen_vectors[1] = Vector_3(evectors[3], evectors[4], evectors[5]);
-    eigen_vectors[2] = Vector_3(evectors[0], evectors[1], evectors[2]);
+    for (int i = 0;i<3;i++)
+      eigen_vectors[i] = Vector_3(evectors[3 * i], evectors[3 * i + 1], evectors[3 * i + 2]);
   }
 };
 
