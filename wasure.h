@@ -53,7 +53,7 @@ private:
   using DT = CGAL::Delaunay_triangulation_3<Geom_traits>;
   using Cell_handle = typename DT::Cell_handle;
   using Vertex_handle = typename DT::Vertex_handle;
-
+  using Facet = typename DT::Facet;
 
   using Point_generator = CGAL::Random_points_in_tetrahedron_3<Point_3>;
 
@@ -66,16 +66,17 @@ private:
   Tree m_tree;
   DT m_triangulation;
   std::vector<Cell_handle> m_tets;
-  std::unordered_map<Cell_handle, std::uint32_t> m_tet_indices;
-  std::vector<std::pair<std::uint32_t, std::uint32_t>> m_edges;
+  std::unordered_map<Cell_handle, std::size_t> m_tet_indices;
+  std::vector<std::pair<std::size_t, std::size_t>> m_edges;
   std::vector<double> m_edge_weights;
   std::vector<std::array<double, 3>> m_mass_function; // empty, occupied, unknown
-  std::vector<std::vector<double>> m_cost_matrix;
+  std::vector<double> m_tet_volumes;
 
+  bool m_has_normals=true;
 public:
   Wasure(PointRange &points, Point_map point_map, Normal_map normal_map)
     : m_points(points), m_point_map(point_map), m_normal_map(normal_map),
-      m_tree(boost::counting_iterator<std::uint32_t>(0), boost::counting_iterator<std::uint32_t>(points.size()), Splitter(), Search_traits(point_map)) {}
+      m_tree(boost::counting_iterator<std::size_t>(0), boost::counting_iterator<std::size_t>(points.size()), Splitter(), Search_traits(point_map)) {}
   ~Wasure() {}
 
   template<typename Concurrency_tag = Sequential_tag, typename DiagonalizeTraits = CGAL::Default_diagonalize_traits<double, 3>>
@@ -97,6 +98,9 @@ public:
         sum[0] += pts.back().x();
         sum[1] += pts.back().y();
         sum[2] += pts.back().z();
+
+        if (pts.size() < 10)
+          continue;
 
         if (it->second < 0.02 && pts.size() < 30)
           continue;
@@ -127,9 +131,21 @@ public:
       }
       assert(entropy != 1000000000);
     }
+
+    orient_features();
+
+    for (auto idx : m_points) {
+      Point_3 p = get(m_point_map, idx);
+      Vector_3 n = get(m_normal_map, idx);
+      Vector_3 np = Vector_3(p.x(), p.y(), p.z());
+      assert(n * np > 0);
+      Vector_3 ev = m_eigen_vectors[idx][2];
+      assert(n * ev > 0);
+      assert(np * ev > 0);
+    }
   }
 
-  void compute_weights(std::uint32_t num_samples = 40) {
+  void compute_mass_function(std::uint32_t num_samples = 40) {
     m_triangulation.insert(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map));
     m_tets.clear();
     m_tets.reserve(m_triangulation.number_of_cells() + 1);
@@ -140,51 +156,136 @@ public:
     }
 
     m_edges.clear();
-    m_edges.resize(m_triangulation.number_of_facets());
+    m_edges.reserve(m_triangulation.number_of_facets());
     m_edge_weights.clear();
     m_edge_weights.reserve(m_triangulation.number_of_facets());
+
+    double edge_weight_sum = 0;
+    double tet_weight_sum = 0;
 
     for (auto it = m_triangulation.finite_facets_begin(); it != m_triangulation.finite_facets_end(); ++it) {
       Cell_handle c1 = it->first;
       Cell_handle c2 = m_triangulation.mirror_facet(*it).first;
-      std::uint32_t idx1 = m_tet_indices[c1];
-      std::uint32_t idx2 = m_tet_indices[c2];
+      std::size_t idx1 = m_tet_indices[c1];
+      std::size_t idx2 = m_tet_indices[c2];
       m_edges.push_back(std::make_pair(idx1, idx2));
       m_edge_weights.push_back(CGAL::sqrt(m_triangulation.triangle(*it).squared_area()));
+      edge_weight_sum += m_edge_weights.back();
     }
 
+    std::cout << "edge weight sum: " << edge_weight_sum << std::endl;
+
     m_mass_function.resize(m_tets.size(), std::array<double, 3>{0, 0, 0});
+    m_tet_volumes.resize(m_tets.size(), 0);
 
     for (int id = 0; id < m_tets.size();id++) {
       if (m_triangulation.is_infinite(m_tets[id])) {
-        m_mass_function[id] = { 0, 1, 0 };
+        m_mass_function[id] = { 1, 0, 0 };
         continue;
       }
 
+      m_tet_volumes[id] = m_triangulation.tetrahedron(m_tets[id]).volume();
+      tet_weight_sum += m_tet_volumes[id];
+
       compute_local_mass(m_tets[id], m_mass_function[id], num_samples);
+      double sum = m_mass_function[id][0] + m_mass_function[id][1] + m_mass_function[id][2];
+      if (sum < 0.99 || sum > 1.01)
+        std::cout << sum << " is out of bounds" << std::endl;
+    }
+
+    std::cout << "tet weight sum: " << tet_weight_sum << std::endl;
+    tet_weight_sum = edge_weight_sum / tet_weight_sum;
+
+    for (int id = 0; id < m_tets.size(); id++) {
+      if (m_triangulation.is_infinite(m_tets[id]))
+        continue;
+
+      m_tet_volumes[id] *= tet_weight_sum;
+    }
+  }
+
+  template<typename PointOutputIterator, typename IndexOutputIterator>
+  void extract_surface_from_weights(double isovalue, PointOutputIterator pit, IndexOutputIterator iit) {
+    std::unordered_map<Vertex_handle, std::uint32_t> vh2idx;
+    for (std::uint32_t i = 0; i < m_tets.size(); ++i) {
+      if (m_triangulation.is_infinite(m_tets[i]))
+        continue;
+
+      double e1 = m_mass_function[i][0];
+      int i1 = (e1 < isovalue) ? -1 : 1;
+
+      for (int j = 0; j < 4; j++) {
+        Cell_handle ch = m_triangulation.mirror_facet(Facet(m_tets[i], j)).first;
+        double e2 = m_mass_function[m_tet_indices[ch]][0];
+        int i2 = (e2 < isovalue) ? -1 : 1;
+        if (i1 * i2 < 0) {
+          std::array<Vertex_handle, 3> vhs = m_triangulation.vertices(Facet(m_tets[i], j));
+          std::vector<std::uint32_t> indices(3);
+          for (std::uint32_t k = 0; k < 3; k++) {
+            auto res = vh2idx.insert(std::make_pair(vhs[k], vh2idx.size()));
+            indices[k] = res.first->second;
+            if (res.second)
+              *pit++ = vhs[k]->point();
+          }
+
+          *iit++ = std::move(indices);
+        }
+      }
     }
   }
 
   template<typename PointOutputIterator, typename IndexOutputIterator>
   void extract_surface(FT lambda, PointOutputIterator pit, IndexOutputIterator iit) {
     std::vector<std::size_t> labels(m_tets.size());
-    CGAL::alpha_expansion_graphcut(m_edges, m_edge_weights, m_cost_matrix, labels);
+    std::vector<double> m_edge_weights_lambda(m_edge_weights.size());
+    std::vector<double> label_values = { 0, 1 };
+    for (std::size_t i = 0;i<m_edge_weights.size();i++)
+      m_edge_weights_lambda[i] = lambda * m_edge_weights[i];
+
+    std::vector<std::vector<double>> m_cost_matrix;
+    m_cost_matrix.resize(label_values.size());
+    for (std::size_t l = 0;l<label_values.size();l++)
+      m_cost_matrix[l].resize(m_tets.size());
+
+    for (int id = 0; id < m_tets.size(); id++) {
+      if (m_triangulation.is_infinite(m_tets[id])) {
+        for (std::size_t l = 0; l < label_values.size(); l++)
+          m_cost_matrix[l][id] = (l == 0) ? 0 : 1000;
+        continue;
+      }
+
+      for (std::size_t l = 0; l < label_values.size(); l++)
+        m_cost_matrix[l][id] = (1 - m_mass_function[id][l]) * m_tet_volumes[id] * (1 - lambda);
+    }
+
+    CGAL::alpha_expansion_graphcut(m_edges, m_edge_weights_lambda, m_cost_matrix, labels);
+
+    int cnt = 0;
+    for (std::size_t i : labels)
+      if (i == 0)
+        cnt++;
+
+    std::cout << cnt << " tets labeled as empty, " << m_tets.size() - cnt << " tets labeled as occupied" << std::endl;
 
     std::unordered_map<Vertex_handle, std::uint32_t> vh2idx;
     for (std::uint32_t i = 0; i < m_tets.size(); ++i) {
-      if (labels[i] == 1)
+      if (m_triangulation.is_infinite(m_tets[i]) || labels[i] == 0)
         continue;
 
       for (int j = 0;j<4;j++) {
-        Cell_handle ch = m_triangulation.mirror_facet(Facet(m_tets[i], j)).first;
+        auto mirror_facet = m_triangulation.mirror_facet(Facet(m_tets[i], j));
+        Cell_handle ch = mirror_facet.first;
         if (labels[m_tet_indices[ch]] == 0) {
-          std::array<Vertex_handle, 3> &vhs = m_triangulation.vertices(Facet(m_tets[i], j));
+          std::array<Vertex_handle, 3> vhs = m_triangulation.vertices(mirror_facet);
+          std::vector<std::uint32_t> indices(3);
           for (std::uint32_t k = 0;k<3;k++) {
             auto res = vh2idx.insert(std::make_pair(vhs[k], vh2idx.size()));
-            *iit++ = res.first->second;
+            indices[k] = res.first->second;
             if (res.second)
               *pit++ = vhs[k]->point();
           }
+
+          *iit++ = std::move(indices);
         }
       }
     }
@@ -265,7 +366,7 @@ private:
         Point_3 s = get(m_point_map, it->first);
         double largest_ev = m_eigen_values[it->first][0];
         std::array<double, 3> point_mass = { 0, 0, 0 };
-        std::array<double, 3> point_coefficients = calculate_point_coefficients(p, s, m_eigen_vectors[it->first]);
+        std::array<double, 3> point_coefficients = calculate_point_coefficients(s, p, m_eigen_vectors[it->first]);
         compute_dst_local_sample(point_coefficients, m_eigen_values[it->first], 1.0, largest_ev, largest_ev, point_mass);
         ds_score(sample_mass, point_mass, sample_mass);
         regularize(sample_mass);
@@ -284,6 +385,15 @@ private:
     mass[2] /= nb_samples;
   }
 
+  void orient_features() {
+    if (m_has_normals) {
+      for (auto idx : m_points) {
+        Vector_3 normal = get(m_normal_map, idx);
+        if (normal * m_eigen_vectors[idx][2] < 0)
+          m_eigen_vectors[idx][2] = -m_eigen_vectors[idx][2];
+      }
+    }
+  }
 
   void compute_dst_local_sample(const std::array<double, 3> &pcoeff, const std::array<double, 3> &eigen_values, double coef_conf, double pdfs_e, double pdfs_o, std::array<double, 3> &mass) {
     double nscale = eigen_values[2];
@@ -318,8 +428,7 @@ private:
     regularize(mass);
   }
 
-
-  std::array<double, 3> calculate_point_coefficients(const Point_3& p, const Point_3& s, const std::array<Vector_3, 3> &eigen_vectors) const {
+  std::array<double, 3> calculate_point_coefficients(const Point_3& s, const Point_3& p, const std::array<Vector_3, 3> &eigen_vectors) const {
     std::array<double, 3> coeffs;
     for (int i = 0; i < 3; i++)
       coeffs[i] = (p - s) * eigen_vectors[i] / (eigen_vectors[i] * eigen_vectors[i]);
