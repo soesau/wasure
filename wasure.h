@@ -27,6 +27,7 @@
 #include <tbb/parallel_for_each.h>
 #endif
 
+#include <unordered_map>
 #include <vector>
 
 namespace CGAL {
@@ -54,15 +55,19 @@ private:
   using Cell_handle = typename DT::Cell_handle;
   using Vertex_handle = typename DT::Vertex_handle;
   using Facet = typename DT::Facet;
+  using Locate_type = typename DT::Locate_type;
 
   using Point_generator = CGAL::Random_points_in_tetrahedron_3<Point_3>;
 
   Point_range& m_points;
   Point_map m_point_map;
   Normal_map m_normal_map;
+  Bbox_3 m_bbox;
   std::vector<std::uint32_t> m_simplified;
   std::vector<std::array<Vector_3, 3>> m_eigen_vectors;
-  std::vector<std::array<FT, 3>> m_eigen_values;
+  std::vector<std::array<double, 3>> m_eigen_values;
+  std::vector<Vector_3> m_origin;
+
   Tree m_tree;
   DT m_triangulation;
   std::vector<Cell_handle> m_tets;
@@ -72,11 +77,15 @@ private:
   std::vector<std::array<double, 3>> m_mass_function; // empty, occupied, unknown
   std::vector<double> m_tet_volumes;
 
-  bool m_has_normals=true;
+  bool m_has_normals;
+  bool m_has_point_origin;
 public:
   Wasure(PointRange &points, Point_map point_map, Normal_map normal_map)
     : m_points(points), m_point_map(point_map), m_normal_map(normal_map),
-      m_tree(boost::counting_iterator<std::size_t>(0), boost::counting_iterator<std::size_t>(points.size()), Splitter(), Search_traits(point_map)) {}
+      m_tree(boost::counting_iterator<std::size_t>(0), boost::counting_iterator<std::size_t>(points.size()), Splitter(), Search_traits(point_map)),
+      m_bbox(CGAL::bbox_3(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map))),
+      m_has_normals(true), m_has_point_origin(false)
+  {}
   ~Wasure() {}
 
   template<typename Concurrency_tag = Sequential_tag, typename DiagonalizeTraits = CGAL::Default_diagonalize_traits<double, 3>>
@@ -146,7 +155,9 @@ public:
   }
 
   void compute_mass_function(std::uint32_t num_samples = 40) {
-    m_triangulation.insert(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map));
+    if (m_triangulation.number_of_vertices() == 0)
+      m_triangulation.insert(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map));
+
     m_tets.clear();
     m_tets.reserve(m_triangulation.number_of_cells() + 1);
     m_tet_indices[m_triangulation.infinite_cell()] = m_tets.size() - 1;
@@ -255,7 +266,7 @@ public:
       }
 
       for (std::size_t l = 0; l < label_values.size(); l++)
-        m_cost_matrix[l][id] = (1 - m_mass_function[id][l]) * m_tet_volumes[id] * (1 - lambda);
+        m_cost_matrix[l][id] = (std::max)(0.0, (1 - m_mass_function[id][l]) * m_tet_volumes[id] * (1 - lambda));
     }
 
     CGAL::alpha_expansion_graphcut(m_edges, m_edge_weights_lambda, m_cost_matrix, labels);
@@ -291,6 +302,15 @@ public:
     }
   }
 
+  std::size_t adaptive_triangulation(FT pscale, int iterations = 10) {
+    std::vector<Point_3> points;
+    create_initial_triangulation(pscale);
+    vertex_k_means(points, iterations);
+    return m_triangulation.number_of_vertices();
+    //m_triangulation.clear();
+    //m_triangulation.insert(points.begin(), points.end());
+  }
+
   void simplify(FT density) {
     CGAL_assertion(m_eigen_values.size() != m_points.size());
     if (m_eigen_values.size() != m_points.size())
@@ -320,7 +340,7 @@ public:
 
 private:
   template<typename DiagonalizeTraits>
-  void pca(const std::vector<Point_3> &pts, const Point_3 &mean, std::array<FT, 3> &eigen_values, std::array<Vector_3, 3> &eigen_vectors) {
+  void pca(const std::vector<Point_3> &pts, const Point_3 &mean, std::array<double, 3> &eigen_values, std::array<Vector_3, 3> &eigen_vectors) {
     std::array<double, 6> covariance = make_array(.0, .0, .0, .0, .0, .0);
     for (const Point_3 &p : pts) {
       Vector_3 d = p - mean;
@@ -349,6 +369,118 @@ private:
     eigen_vectors[2] = Vector_3(evectors[0], evectors[1], evectors[2]);
   }
 
+  void vertex_k_means(std::vector<Point_3>& points, std::size_t iterations) {
+    points.clear();
+
+    CGAL::Random random = CGAL::get_default_random();
+    CGAL::Unique_hash_map<Vertex_handle, std::size_t> vh2idx;
+    std::vector<std::array<FT, 3>> pos, normal, scale, los;
+    std::vector<std::size_t> count;
+    pos.resize(m_triangulation.number_of_vertices());
+    normal.resize(m_triangulation.number_of_vertices());
+    scale.resize(m_triangulation.number_of_vertices());
+    los.resize(m_triangulation.number_of_vertices());
+    count.resize(m_triangulation.number_of_vertices());
+
+    std::size_t idx = 0;
+    for (auto it : m_triangulation.finite_vertex_handles())
+      vh2idx[it] = idx++;
+
+    for (std::size_t i = 0; i < iterations; i++) {
+      std::fill(pos.begin(), pos.end(), std::array<FT, 3>({ .0, .0, .0 }));
+      std::fill(normal.begin(), normal.end(), std::array<FT, 3>({ .0, .0, .0 }));
+      std::fill(scale.begin(), scale.end(), std::array<FT, 3>({ .0, .0, .0 }));
+      std::fill(los.begin(), los.end(), std::array<FT, 3>({ .0, .0, .0 }));
+      std::fill(count.begin(), count.end(), 0);
+
+      for (auto idx : m_points) {
+        Point_3& p = get(m_point_map, idx);
+        Vertex_handle vh = m_triangulation.nearest_vertex(p);
+        std::size_t vhidx = vh2idx[vh];
+
+        pos[vhidx][0] += p.x();
+        pos[vhidx][1] += p.y();
+        pos[vhidx][2] += p.z();
+        count[vhidx]++;
+
+        if (i == (iterations - 1)) {
+          normal[vhidx][0] += m_eigen_vectors[idx][2].x();
+          normal[vhidx][1] += m_eigen_vectors[idx][2].y();
+          normal[vhidx][2] += m_eigen_vectors[idx][2].z();
+
+          scale[vhidx][0] += m_eigen_values[idx][0];
+          scale[vhidx][1] += m_eigen_values[idx][1];
+          scale[vhidx][2] += m_eigen_values[idx][2];
+
+          if (!m_origin.empty()) {
+            los[idx][0] += m_origin[idx].x();
+            los[idx][1] += m_origin[idx].y();
+            los[idx][2] += m_origin[idx].z();
+          }
+        }
+      }
+      std::cout << count[5] << std::endl;
+
+      for (auto it : m_triangulation.finite_vertex_handles()) {
+        std::size_t vhidx = vh2idx[it];
+        std::array<FT, 3>& mean = pos[vhidx];
+        std::size_t c = count[vhidx];
+        if (c == 0)
+          continue;
+
+        for (FT& x : mean) x /= c;
+
+        if (i < (iterations - 1))
+          m_triangulation.move(it, Point_3(mean[0], mean[1], mean[2]));
+        else {
+          points.push_back(Point_3(mean[0], mean[1], mean[2]));
+          if (!m_origin.empty() && random.uniform_01<double>() > 0.8) {
+            std::array<FT, 3>& norm = normal[vhidx];
+            std::array<FT, 3>& sca = scale[vhidx];
+            for (FT& x : norm) x /= c;
+            for (FT& x : sca) x /= c;
+
+            double largest_ev = (std::max)({ sca[0], sca[1], sca[2] }) / 3.0;
+
+            points.push_back(Point_3(mean[0] - largest_ev * norm[0], mean[1] - largest_ev * norm[1], mean[2] - largest_ev * norm[2]));
+            //std::array<FT, 3>& lsum = los[vhidx];
+            //it->info().line_of_sight = Vector_3(lsum[0] / c, lsum[1] / c, lsum[2] / c);
+          }
+        }
+      }
+    }
+  }
+
+  void create_initial_triangulation(FT pscale) {
+    m_triangulation.clear();
+
+    std::vector<std::size_t> indices(m_points.size());
+    std::iota(indices.begin(), indices.end(), 0);
+    CGAL::cpp98::random_shuffle(indices.begin(), indices.end(), CGAL::get_default_random());
+
+    for (std::size_t idx : indices) {
+      Locate_type locate_type;
+      Point_3& p = get(m_point_map, idx);
+      int li, lj;
+      Cell_handle ch = m_triangulation.locate(p, locate_type, li, lj);
+      if (locate_type > Locate_type::CELL)
+        m_triangulation.insert(p);
+      else {
+        bool insert = true;
+        for (int i = 0; i < 4; i++) {
+          std::array<double, 3> coef = calculate_point_coefficients(p, ch->vertex(i)->point(), m_eigen_vectors[idx]);
+          for (int d = 0; d < 3; d++)
+            if (fabs(coef[d]) < m_eigen_values[idx][d] * pscale) {
+              insert = false;
+              i = 5; // break outer loop
+              break;
+            }
+        }
+        if (insert)
+          m_triangulation.insert(p);
+      }
+    }
+  }
 
   void compute_local_mass(Cell_handle ch, std::array<FT, 3> &mass, std::uint32_t nb_samples) {
     Point_generator pg(m_triangulation.tetrahedron(ch));
@@ -435,7 +567,6 @@ private:
     return coeffs;
   }
 
-
   void ds_score(const std::array<double, 3> &v1, const std::array<double, 3> &v2, std::array<double, 3> &v3) {
     double vK = v1[1] * v2[0] + v1[0] * v2[1];
     CGAL_assertion(vK != 1);
@@ -443,7 +574,6 @@ private:
     v3[1] = (v1[1] * v2[1] + v1[1] * v2[2] + v1[2] * v2[1]) / (1 - vK);
     v3[2] = (v1[2] * v2[2]) / (1 - vK);
   }
-
 
   void regularize(std::array<double, 3> &mass) const {
     mass[0] = std::clamp(mass[0], 0.0, 1.0);
