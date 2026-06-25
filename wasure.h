@@ -13,6 +13,10 @@
 #ifndef CGAL_WATERTIGHT_SURFACE_RECONSTRUCTION_H
 #define CGAL_WATERTIGHT_SURFACE_RECONSTRUCTION_H
 
+//#define CGAL_SCANORIENT_DUMP_RANDOM_SCANLINES
+//#define CGAL_SCANLINE_ORIENT_VERBOSE
+
+#include "scanline_orient_normals.h"
 #include <CGAL/Splitters.h>
 #include <CGAL/Default_diagonalize_traits.h>
 #include <CGAL/Search_traits_3.h>
@@ -22,6 +26,7 @@
 #include <CGAL/Delaunay_triangulation_3.h>
 #include <CGAL/boost/graph/alpha_expansion_graphcut.h>
 #include <CGAL/point_generators_3.h>
+#include <CGAL/jet_estimate_normals.h>
 
 #ifdef CGAL_LINKED_WITH_TBB
 #include <tbb/parallel_for_each.h>
@@ -32,24 +37,32 @@
 
 namespace CGAL {
 
-template<typename GeomTraits, typename PointRange, typename PointMap, typename NormalMap>
+template<typename PointSet>
 class Wasure {
 public:
-  using Geom_traits = GeomTraits;
-  using Point_range = PointRange;
-  using Point_map = PointMap;
-  using Normal_map = NormalMap;
+  using Point_set = PointSet;
+  using Geom_traits = typename Kernel_traits<typename Point_set::Point_3>::Kernel;
   using FT = typename Geom_traits::FT;
-  using Point_3 = typename Geom_traits::Point_3;
-  using Vector_3 = typename Geom_traits::Vector_3;
+  using Point_3 = typename Point_set::Point_3;
 
 private:
+  using Vector_3 = typename Point_set::Vector_3;
+  using Segment_3 = typename Geom_traits::Segment_3;
+
+  using Point_map = typename Point_set::Point_map;
+  using Normal_map = typename Point_set::Vector_map;
+  using Vector_map = typename Point_set::Vector_map;
+  using Scan_angle_map = typename Point_set::template Property_map<float>;
+  using Scan_ID_map = typename Point_set::template Property_map<unsigned char>;
+  using Point_source_ID_map = typename Point_set::template Property_map<unsigned short>;
+
   using Search_traits_base = Search_traits_3<Geom_traits>;
-  using Search_traits = Search_traits_adapter<std::uint32_t, Point_map, Search_traits_base>;
-  using Splitter = Sliding_midpoint<Search_traits>;
-  using Distance = Distance_adapter<std::uint32_t, Point_map, Euclidean_distance<Search_traits_base>>;
-  using Tree = Kd_tree<Search_traits, Splitter, Tag_true, Tag_true>;
-  using Knn = Orthogonal_k_neighbor_search<Search_traits, Distance, Splitter, Tree>;
+  using Search_traits = Search_traits_adapter<typename Point_set::Index, Point_map, Search_traits_base>;
+  using Distance = CGAL::Distance_adapter<typename Point_set::Index, typename Point_set::Point_map, CGAL::Euclidean_distance<Search_traits_base> >;
+  using Splitter = CGAL::Sliding_midpoint<Search_traits>;
+  using Search_tree = CGAL::Kd_tree<Search_traits, Splitter, CGAL::Tag_true, CGAL::Tag_true>;
+  using Neighbor_search = CGAL::Orthogonal_k_neighbor_search<Search_traits, Distance, Splitter, Search_tree>;
+  using Tree = typename Neighbor_search::Tree;
 
   using DT = CGAL::Delaunay_triangulation_3<Geom_traits>;
   using Cell_handle = typename DT::Cell_handle;
@@ -59,16 +72,17 @@ private:
 
   using Point_generator = CGAL::Random_points_in_tetrahedron_3<Point_3>;
 
-  Point_range& m_points;
+  Point_set &m_points;
   Point_map m_point_map;
   Normal_map m_normal_map;
+  Vector_map m_los;
   Bbox_3 m_bbox;
   std::vector<std::uint32_t> m_simplified;
   std::vector<std::array<Vector_3, 3>> m_eigen_vectors;
   std::vector<std::array<double, 3>> m_eigen_values;
-  std::vector<Vector_3> m_origin;
 
-  Tree m_tree;
+  Distance m_dist;
+  std::shared_ptr<Tree> m_tree_ptr;
   DT m_triangulation;
   std::vector<Cell_handle> m_tets;
   std::unordered_map<Cell_handle, std::size_t> m_tet_indices;
@@ -77,15 +91,53 @@ private:
   std::vector<std::array<double, 3>> m_mass_function; // empty, occupied, unknown
   std::vector<double> m_tet_volumes;
 
-  bool m_has_normals;
-  bool m_has_point_origin;
+  bool m_has_los;
+
 public:
-  Wasure(PointRange &points, Point_map point_map, Normal_map normal_map)
-    : m_points(points), m_point_map(point_map), m_normal_map(normal_map),
-      m_tree(boost::counting_iterator<std::size_t>(0), boost::counting_iterator<std::size_t>(points.size()), Splitter(), Search_traits(point_map)),
-      m_bbox(CGAL::bbox_3(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map))),
-      m_has_normals(true), m_has_point_origin(false)
-  {}
+  template<typename Concurrency_tag = Sequential_tag>
+  Wasure(Point_set&points)
+    : m_points(points), m_point_map(points.point_map()), m_dist(points.point_map()),
+      m_bbox(CGAL::bbox_3(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map)))
+  {
+    points.collect_garbage();
+    for (auto idx : m_points) {
+      Point_3 &p = get(m_point_map, idx);
+      p = Point_3(p.x() - m_bbox.xmin(), p.y() - m_bbox.ymin(), p.z() - m_bbox.zmin());
+    }
+    m_tree_ptr.reset(new Tree(m_points.begin(), m_points.end(), Tree::Splitter(), Search_traits(m_points.point_map())));
+    CGAL_assertion(!points.has_garbage());
+    if (!points.has_normal_map()) {
+      std::optional<Scan_angle_map> scan_angle_map = m_points.property_map<float>("scan_angle");
+      std::optional<Scan_ID_map> scan_id_map = m_points.property_map<unsigned char>("scan_direction_flag");
+      std::optional<Point_source_ID_map> point_source_id_map = m_points.property_map<unsigned short>("point_source_ID");
+      //std::optional<
+      CGAL_assertion(scan_angle_map.has_value() && (scan_id_map.has_value() || point_source_id_map.has_value()));
+      m_los = m_points.add_property_map<Vector_3>("los").first;
+      m_has_los = true;
+      //CGAL::jet_estimate_normals<Concurrency_tag>(m_points, 100, CGAL::parameters::point_map(m_point_map).normal_map(m_normal_map));
+      if (scan_id_map.has_value())
+        CGAL::scanline_orient_normals(m_points,
+          CGAL::parameters::point_map(m_points.point_map()).
+          normal_map(m_los).
+          scan_angle_map(scan_angle_map.value()).
+          scanline_id_map(scan_id_map.value()));
+      else
+        CGAL::scanline_orient_normals(m_points,
+          CGAL::parameters::point_map(m_points.point_map()).
+          normal_map(m_los).
+          scan_angle_map(scan_angle_map.value()).
+          scanline_id_map(point_source_id_map.value()));
+
+      for (auto idx : m_points) {
+        Vector_3 &v = get(m_los, idx);
+        v = Vector_3(v.x() * 200.0, v.y() * 200.0, v.z() * 200.0);
+      }
+
+      dump_los("los.ply");
+    }
+    else m_has_los = false;
+  }
+
   ~Wasure() {}
 
   template<typename Concurrency_tag = Sequential_tag, typename DiagonalizeTraits = CGAL::Default_diagonalize_traits<double, 3>>
@@ -100,8 +152,8 @@ public:
       double entropy = 1000000000;
       pts.clear();
       std::array<FT, 3> sum = {0, 0, 0};
-      Knn search(m_tree, get(m_point_map, idx), 150);
-      for (typename Knn::iterator it = search.begin(); it != search.end(); ++it) {
+      Neighbor_search search(*m_tree_ptr, get(m_point_map, idx), 150, 0, true, m_dist);
+      for (typename Neighbor_search::iterator it = search.begin(); it != search.end(); ++it) {
         pts.push_back(get(m_point_map, it->first));
 
         sum[0] += pts.back().x();
@@ -143,9 +195,10 @@ public:
 
     orient_features();
 
+    Normal_map normal_map = m_points.normal_map();
     for (auto idx : m_points) {
       Point_3 p = get(m_point_map, idx);
-      Vector_3 n = get(m_normal_map, idx);
+      Vector_3 n = get(normal_map, idx);
       Vector_3 np = Vector_3(p.x(), p.y(), p.z());
       assert(n * np > 0);
       Vector_3 ev = m_eigen_vectors[idx][2];
@@ -199,6 +252,7 @@ public:
       tet_weight_sum += m_tet_volumes[id];
 
       compute_local_mass(m_tets[id], m_mass_function[id], num_samples);
+
       double sum = m_mass_function[id][0] + m_mass_function[id][1] + m_mass_function[id][2];
       if (sum < 0.99 || sum > 1.01)
         std::cout << sum << " is out of bounds" << std::endl;
@@ -212,6 +266,15 @@ public:
         continue;
 
       m_tet_volumes[id] *= tet_weight_sum;
+    }
+
+    dump_mass_function("mf_after_local.ply");
+
+    if (m_has_los) {
+      compute_origin_mass();
+      dump_mass_function("mf_after_origin.ply");
+      penalize_flight_path();
+      dump_mass_function("mf_after_flight.ply");
     }
   }
 
@@ -325,8 +388,8 @@ public:
         continue;
       m_simplified.push_back(idx);
       const Point_3 &p = get(m_point_map, idx);
-      Knn search(m_tree, p, 50);
-      for (typename Knn::iterator it = search.begin() + 1; it != search.end(); ++it) {
+      Neighbor_search search(*m_tree_ptr, p, 50, 0, true, m_dist);
+      for (typename Neighbor_search::iterator it = search.begin() + 1; it != search.end(); ++it) {
         Vector_3 d = get(m_point_map, it->first) - p;
 
         for (int i = 0; i < 3; i++)
@@ -382,6 +445,8 @@ private:
     los.resize(m_triangulation.number_of_vertices());
     count.resize(m_triangulation.number_of_vertices());
 
+    bool has_los = m_points.has_property_map<Vector_3>("los");
+
     std::size_t idx = 0;
     for (auto it : m_triangulation.finite_vertex_handles())
       vh2idx[it] = idx++;
@@ -412,14 +477,14 @@ private:
           scale[vhidx][1] += m_eigen_values[idx][1];
           scale[vhidx][2] += m_eigen_values[idx][2];
 
-          if (!m_origin.empty()) {
-            los[idx][0] += m_origin[idx].x();
-            los[idx][1] += m_origin[idx].y();
-            los[idx][2] += m_origin[idx].z();
+          if (has_los) {
+            Vector_3 vlos = get(m_los, idx);
+            los[vhidx][0] += vlos.x();
+            los[vhidx][1] += vlos.y();
+            los[vhidx][2] += vlos.z();
           }
         }
       }
-      std::cout << count[5] << std::endl;
 
       for (auto it : m_triangulation.finite_vertex_handles()) {
         std::size_t vhidx = vh2idx[it];
@@ -434,7 +499,7 @@ private:
           m_triangulation.move(it, Point_3(mean[0], mean[1], mean[2]));
         else {
           points.push_back(Point_3(mean[0], mean[1], mean[2]));
-          if (!m_origin.empty() && random.uniform_01<double>() > 0.8) {
+          if (!has_los && random.uniform_01<double>() > 0.8) {
             std::array<FT, 3>& norm = normal[vhidx];
             std::array<FT, 3>& sca = scale[vhidx];
             for (FT& x : norm) x /= c;
@@ -485,20 +550,20 @@ private:
   void compute_local_mass(Cell_handle ch, std::array<FT, 3> &mass, std::uint32_t nb_samples) {
     Point_generator pg(m_triangulation.tetrahedron(ch));
     for (std::uint32_t i = 0; i < nb_samples; ++i) {
-      Point_3 p;
+      Point_3 s;
       if (i == 0)
-        p = CGAL::centroid(ch->vertex(0)->point(), ch->vertex(1)->point(), ch->vertex(2)->point(), ch->vertex(3)->point());
+        s = CGAL::centroid(ch->vertex(0)->point(), ch->vertex(1)->point(), ch->vertex(2)->point(), ch->vertex(3)->point());
       else
-        p = *pg++;
+        s = *pg++;
 
       // Compute local mass for each sample
-      Knn search(m_tree, p, 30);
+      Neighbor_search search(*m_tree_ptr, s, 30, 0, true, m_dist);
       std::array<double, 3> sample_mass = { 0, 0, 1 };
-      for (typename Knn::iterator it = search.begin(); it != search.end(); ++it) {
-        Point_3 s = get(m_point_map, it->first);
+      for (typename Neighbor_search::iterator it = search.begin(); it != search.end(); ++it) {
+        Point_3 p = get(m_point_map, it->first);
         double largest_ev = m_eigen_values[it->first][0];
         std::array<double, 3> point_mass = { 0, 0, 0 };
-        std::array<double, 3> point_coefficients = calculate_point_coefficients(s, p, m_eigen_vectors[it->first]);
+        std::array<double, 3> point_coefficients = calculate_point_coefficients(p, s, m_eigen_vectors[it->first]);
         compute_dst_local_sample(point_coefficients, m_eigen_values[it->first], 1.0, largest_ev, largest_ev, point_mass);
         ds_score(sample_mass, point_mass, sample_mass);
         regularize(sample_mass);
@@ -517,13 +582,109 @@ private:
     mass[2] /= nb_samples;
   }
 
+  void compute_origin_mass(std::uint32_t nb_samples = 40, unsigned int ratio = 0) {
+    std::optional<Vector_map> res = m_points.property_map<Vector_3>("los");
+    CGAL_assertion(res.has_value());
+    Vector_map los = res.value();
+    Cell_handle hint = Cell_handle();
+    for (int i = 0;i<m_points.size();i++) {
+//       if (ratio != 0 && i % ratio != 0)
+//         continue;
+
+      Point_3 &p = get(m_point_map, i);
+      Vector_3 &vlos = get(los, i);
+
+      if (std::isnan(vlos.x()) || std::isnan(vlos.y()) || std::isnan(vlos.z()))
+        continue;
+
+      Point_3 center = p + vlos;
+      Point_3 mirrored_center = p - vlos;
+
+      walk_los(p, center, mirrored_center, hint, i, nb_samples);
+    }
+  }
+
+  void dump_mass_function(const std::string& filename) {
+    std::ofstream ofile(filename);
+    ofile << std::setprecision(17);
+    ofile << "ply" << std::endl <<
+      "format ascii 1.0" << std::endl <<
+      "element vertex " << m_tet_indices.size() << std::endl <<
+      "property double x" << std::endl <<
+      "property double y" << std::endl <<
+      "property double z" << std::endl <<
+      "property uchar red" << std::endl <<
+      "property uchar green" << std::endl <<
+      "property uchar blue" << std::endl <<
+      "end_header" << std::endl;
+
+    for (auto ch = m_triangulation.cells_begin(); ch != m_triangulation.cells_end(); ++ch) {
+      std::size_t chidx = m_tet_indices[ch];
+      ofile << CGAL::centroid(ch->vertex(0)->point(), ch->vertex(1)->point(), ch->vertex(2)->point(), ch->vertex(3)->point());
+
+      ofile << " " << int(m_mass_function[chidx][0] * 255.0 + 0.5) << " " << int(m_mass_function[chidx][1] * 255.0 + 0.5) << " " << int(m_mass_function[chidx][2] * 255.0 + 0.5) << "\n";
+    }
+  }
+
+  void dump_los(const std::string& filename) {
+    if (!m_has_los) {
+      std::cout << "dump_los called without having line of sight data" << std::endl;
+      return;
+    }
+    std::ofstream ofile(filename);
+    ofile << std::setprecision(17);
+    ofile << "ply" << std::endl <<
+      "format ascii 1.0" << std::endl <<
+      "element vertex " << m_points.size() << std::endl <<
+      "property double x" << std::endl <<
+      "property double y" << std::endl <<
+      "property double z" << std::endl <<
+      "property double nx" << std::endl <<
+      "property double ny" << std::endl <<
+      "property double nz" << std::endl <<
+      "end_header" << std::endl;
+
+    for (auto idx : m_points) {
+      ofile << get(m_point_map, idx);
+      Vector_3 los = get(m_los, idx);
+      if (std::isnan(los.x()) || std::isnan(los.y()) || std::isnan(los.z()))
+        ofile << " 0 0 0\n";
+      else ofile << " " << los << "\n";
+    }
+  }
+
+  void penalize_flight_path() {
+    std::optional<Vector_map> res = m_points.property_map<Vector_3>("los");
+    CGAL_assertion(res.has_value());
+    Vector_map los = res.value();
+
+    Cell_handle hint = Cell_handle();
+    for (std::uint32_t i = 0; i < m_points.size(); ++i) {
+      const Point_3 &p = get(m_point_map, i);
+      const Vector_3 &vlos = get(los, i);
+
+      if (std::isnan(vlos.x()) || std::isnan(vlos.y()) || std::isnan(vlos.z()))
+        continue;
+
+      Cell_handle ch = m_triangulation.locate(p + vlos, hint);
+      hint = ch;
+
+      int ind_inf;
+      if (ch->has_vertex(m_triangulation.infinite_vertex(), ind_inf))
+        continue;
+
+      std::size_t cidx = m_tet_indices[ch];
+
+      ds_score(m_mass_function[cidx], {0.05, 0, 0.95} , m_mass_function[cidx]);
+    }
+  }
+
   void orient_features() {
-    if (m_has_normals) {
-      for (auto idx : m_points) {
-        Vector_3 normal = get(m_normal_map, idx);
-        if (normal * m_eigen_vectors[idx][2] < 0)
-          m_eigen_vectors[idx][2] = -m_eigen_vectors[idx][2];
-      }
+    Vector_map ref = (m_has_los) ? m_los : m_normal_map;
+    for (auto idx : m_points) {
+      Vector_3 normal = get(ref, idx);
+      if (normal * m_eigen_vectors[idx][2] < 0)
+        m_eigen_vectors[idx][2] = -m_eigen_vectors[idx][2];
     }
   }
 
@@ -560,6 +721,48 @@ private:
     regularize(mass);
   }
 
+  void compute_dst_los_samples(const Cell_handle &ch, const Point_3 &p, const Point_3& center, std::size_t pidx, std::uint32_t nb_samples) {
+    std::size_t cidx = m_tet_indices[ch];
+    Point_generator pg(m_triangulation.tetrahedron(ch));
+    for (std::uint32_t i = 0; i < nb_samples; ++i) {
+      Point_3 s;
+      if (i == 0)
+        s = CGAL::centroid(ch->vertex(0)->point(), ch->vertex(1)->point(), ch->vertex(2)->point(), ch->vertex(3)->point());
+      else
+        s = *pg++;
+
+      std::array<double, 3> point_coefficients = calculate_point_coefficients(p, s, m_eigen_vectors[cidx]);
+      std::array<double, 3> &mass = m_mass_function[cidx]; // pe1, po1, pu1
+      std::array<double, 3> mass2;
+
+      //double angle;
+      compute_dst_mass_beam(point_coefficients, m_eigen_values[cidx], /*angle, ANGLE_SCALE,*/ 1.0, mass2);
+      mass[0] *= 1.0;
+      mass[1] = 0;
+      mass[2] = 1.0 - mass[0];
+      ds_score(mass, mass2, mass);
+      regularize(mass);
+    }
+  }
+
+  void compute_dst_mass_beam(const std::array<double, 3>& pcoeff, const std::array<double, 3>& eigen_values, /*double angle, double angle_scale,*/ double coef_conf, std::array<double, 3> &mass)
+  {
+    double c3 = pcoeff[2];
+    double nscale = eigen_values[2];
+    if (nscale <= 0) nscale = 0.000001;
+    if (c3 >= 0)
+    {
+      mass[0] = 1 - (exp(-fabs(c3) / (nscale * 2)));
+      mass[1] = 0;
+    }
+    else if (c3 < 0)
+      mass[0] = mass[1] = 0;
+
+    mass[0] *= coef_conf;
+    mass[1] *= coef_conf;
+    regularize(mass);
+  }
+
   std::array<double, 3> calculate_point_coefficients(const Point_3& s, const Point_3& p, const std::array<Vector_3, 3> &eigen_vectors) const {
     std::array<double, 3> coeffs;
     for (int i = 0; i < 3; i++)
@@ -585,6 +788,51 @@ private:
       mass[1] /= sum;
       mass[2] = 0;
     }
+  }
+
+  Cell_handle walk_los(const Point_3& p, const Point_3& center, const Point_3& mirrored, Cell_handle hint, std::size_t pidx, std::uint32_t nb_samples) {
+    CGAL_assertion(m_triangulation.number_of_vertices() > 1);
+    Segment_3 seg(center, p);
+
+    Cell_handle start = m_triangulation.locate(center, hint);
+    Cell_handle start_cell = start;
+
+    int ind_inf;
+    if (start->has_vertex(m_triangulation.infinite_vertex(), ind_inf))
+      start = start->neighbor(ind_inf);
+
+    Cell_handle cur = start, prev = Cell_handle();
+
+    bool found_next = true;
+    for (int iteration = 0; iteration < 10000 && found_next; iteration++) {
+      found_next = false;
+      Tetrahedron_3 tet = m_triangulation.tetrahedron(cur);
+
+      if (CGAL::do_intersect(tet, seg)) {
+        //compute_dst_los_samples(c, p, center, pidx, nb_samples);
+      }
+
+      std::vector<Point_3> pts = { cur->vertex(0)->point(), cur->vertex(1)->point(), cur->vertex(2)->point(), cur->vertex(3)->point() };
+      for (int i = 0; i < 4; i++) {
+        Cell_handle next = cur->neighbor(i);
+        if (next == prev)
+          continue;
+        Point_3 bkp = pts[i];
+        pts[i] = mirrored;
+        if (CGAL::orientation(pts[0], pts[1], pts[2], pts[3]) != CGAL::NEGATIVE) {
+          pts[i] = bkp;
+          continue;
+        }
+        if (next->has_vertex(m_triangulation.infinite_vertex(), ind_inf))
+          return start_cell;
+
+        prev = cur;
+        cur = next;
+        found_next = true;
+      }
+    }
+
+    return start_cell;
   }
 };
 

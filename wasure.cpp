@@ -18,26 +18,29 @@ using K = CGAL::Exact_predicates_inexact_constructions_kernel;
 using Point_3 = K::Point_3;
 using Vector_3 = K::Vector_3;
 using Point_set = CGAL::Point_set_3<Point_3, Vector_3>;
-using Wasure = CGAL::Wasure<K, Point_set, Point_set::Point_map, Point_set::Vector_map>;
-
+using Wasure = CGAL::Wasure<Point_set>;
 
 int main() {
   CGAL::Real_timer timer;
   timer.start();
-  Point_set ps(true);
+  Point_set ps;
+
+  //std::ifstream ifile("C:/dev/sparkling-wasure/datas/lidar_hd_crop_1/LHD_FXX_0635_6857_PTS_C_LAMB93_IGN69.copc.crop.laz", std::ios::binary);
+  std::ifstream ifile("C:/dev/sparkling-wasure/datas/lidar_hd_crop_2/Semis_2021_0912_6457_LA93_IGN69.las", std::ios::binary);
+  CGAL::IO::read_LAS(ifile, ps);
 
   //std::string filename = CGAL::data_file_path("points_3/building.ply");
-  std::string filename = CGAL::data_file_path("points_3/chair.xyz");
+  //std::string filename = CGAL::data_file_path("points_3/chair.xyz");
   //std::string filename = CGAL::data_file_path("points_3/cube_normals.xyz");
   //std::string filename = CGAL::data_file_path("points_3/sphere_1k.xyz");
-  bool res = CGAL::IO::read_points(filename, ps.index_back_inserter(),
-    CGAL::parameters::point_map(ps.point_push_map()).normal_map(ps.normal_push_map()));
+//   bool res = CGAL::IO::read_points(filename, ps.index_back_inserter(),
+//     CGAL::parameters::point_map(ps.point_push_map()).normal_map(ps.normal_push_map()));
 
   timer.stop();
   std::cout << "Reading " << ps.size() << " points: " << timer.time() << " seconds." << std::endl;
   timer.reset(); timer.start();
 
-  Wasure wasure(ps, ps.point_map(), ps.normal_map());
+  Wasure wasure(ps);
 
   wasure.compute_features();
 
