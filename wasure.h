@@ -151,7 +151,7 @@ public:
     for (auto idx : m_points) {
       double entropy = 1000000000;
       pts.clear();
-      std::array<FT, 3> sum = {0, 0, 0};
+      std::array<FT, 3> sum = { 0, 0, 0 };
       Neighbor_search search(*m_tree_ptr, get(m_point_map, idx), 150, 0, true, m_dist);
       for (typename Neighbor_search::iterator it = search.begin(); it != search.end(); ++it) {
         pts.push_back(get(m_point_map, it->first));
@@ -169,11 +169,11 @@ public:
         std::array<FT, 3> eigen_values;
         std::array<Vector_3, 3> eigen_vectors;
 
-        pca<DiagonalizeTraits>(pts, Point_3(sum[0]/pts.size(), sum[1]/pts.size(), sum[2]/pts.size()), eigen_values, eigen_vectors);
+        pca<DiagonalizeTraits>(pts, Point_3(sum[0] / pts.size(), sum[1] / pts.size(), sum[2] / pts.size()), eigen_values, eigen_vectors);
 
         double cur_entropy = 0;
 
-        std::array<FT, 3> ev = {.0, .0, .0};
+        std::array<FT, 3> ev = { .0, .0, .0 };
 
         // Normalization like in reference implementation
         double sum = eigen_values[0] + eigen_values[1] + eigen_values[2];
@@ -181,7 +181,7 @@ public:
         ev[1] = (eigen_values[1] - eigen_values[2]) / sum;
         ev[2] = eigen_values[2] / sum;
 
-        for (int i = 0;i<3;i++)
+        for (int i = 0; i < 3; i++)
           cur_entropy += -ev[0] * log(ev[0]);
 
         if (cur_entropy < entropy) {
@@ -205,6 +205,82 @@ public:
       assert(n * ev > 0);
       assert(np * ev > 0);
     }
+
+    dump_features("out_sig.ply", true);
+  }
+
+  template<typename Concurrency_tag = Sequential_tag, typename DiagonalizeTraits = CGAL::Default_diagonalize_traits<double, 3>>
+  void compute_features_svd() {
+    std::vector<Point_3> pts;
+    pts.reserve(150);
+    Eigen::MatrixXf mat(150, 3);
+
+    m_eigen_values.resize(m_points.size());
+    m_eigen_vectors.resize(m_points.size());
+
+    for (auto idx : m_points) {
+      double entropy = 1000000000;
+      pts.clear();
+      std::array<float, 3> sum = { 0, 0, 0 };
+      Neighbor_search search(*m_tree_ptr, get(m_point_map, idx), 150, 0, true, m_dist);
+      int k = 0;
+      for (typename Neighbor_search::iterator it = search.begin(); it != search.end(); ++it) {
+        pts.push_back(get(m_point_map, it->first));
+        const Point_3 &p = get(m_point_map, it->first);
+        mat.row(k) << p.x(), p.y(), p.z();
+        k++;
+
+        sum[0] += pts.back().x();
+        sum[1] += pts.back().y();
+        sum[2] += pts.back().z();
+
+        //if (k < 10)
+        //  continue;
+
+        if (it->second < 0.02 && k < 30)
+          continue;
+
+        std::array<FT, 3> singular_values;
+        std::array<Vector_3, 3> eigen_vectors;
+
+        svd(mat, sum, singular_values, eigen_vectors);
+
+        double cur_entropy = 0;
+
+        std::array<FT, 3> ev = { .0, .0, .0 };
+
+        // Normalization like in reference implementation
+        double sum = singular_values[0] + singular_values[1] + singular_values[2];
+        ev[0] = (singular_values[0] - singular_values[1]) / sum;
+        ev[1] = (singular_values[1] - singular_values[2]) / sum;
+        ev[2] = singular_values[2] / sum;
+
+        for (int i = 0; i < 3; i++)
+          cur_entropy += -ev[0] * log(ev[0]);
+
+        if (cur_entropy < entropy) {
+          entropy = cur_entropy;
+          m_eigen_values[idx] = singular_values;
+          m_eigen_vectors[idx] = eigen_vectors;
+        }
+      }
+      assert(entropy != 1000000000);
+    }
+
+    orient_features();
+
+    Normal_map normal_map = m_points.normal_map();
+    for (auto idx : m_points) {
+      Point_3 p = get(m_point_map, idx);
+      Vector_3 n = get(normal_map, idx);
+      Vector_3 np = Vector_3(p.x(), p.y(), p.z());
+      assert(n * np > 0);
+      Vector_3 ev = m_eigen_vectors[idx][2];
+      assert(n * ev > 0);
+      assert(np * ev > 0);
+    }
+
+    dump_features("out_sig_svd.ply", true);
   }
 
   void compute_mass_function(std::uint32_t num_samples = 40) {
@@ -270,7 +346,7 @@ public:
 
     dump_mass_function("mf_after_local.ply");
 
-    if (m_has_los) {
+    if (false && m_has_los) {
       compute_origin_mass();
       dump_mass_function("mf_after_origin.ply");
       penalize_flight_path();
@@ -430,6 +506,22 @@ private:
     eigen_vectors[0] = Vector_3(evectors[6], evectors[7], evectors[8]);
     eigen_vectors[1] = Vector_3(evectors[3], evectors[4], evectors[5]);
     eigen_vectors[2] = Vector_3(evectors[0], evectors[1], evectors[2]);
+  }
+
+  void svd(Eigen::MatrixXf &mat, const std::array<float, 3> &sum, std::array<double, 3> &sv, std::array<Vector_3, 3> &ev) {
+    Eigen::MatrixXf m = mat.rowwise() - mat.colwise().mean();
+    Eigen::JacobiSVD<Eigen::MatrixXf> svd(m, Eigen::ComputeThinU | Eigen::ComputeThinV);
+    Eigen::MatrixXf svm = svd.singularValues();
+    Eigen::MatrixXf evm = svd.matrixV();
+
+    ev[0] = Vector_3(evm(0, 0), evm(0, 1), evm(0, 2));
+    ev[1] = Vector_3(evm(1, 0), evm(1, 1), evm(1, 2));
+    ev[2] = Vector_3(evm(2, 0), evm(2, 1), evm(2, 2));
+
+    double v_min = 0.0000001;
+    sv[0] = (svm(0) < v_min || std::isnan(svm(0))) ? v_min : svm(0);
+    sv[1] = (svm(1) < v_min || std::isnan(svm(1))) ? v_min : svm(1);
+    sv[2] = (svm(2) < v_min || std::isnan(svm(2))) ? v_min : svm(2);
   }
 
   void vertex_k_means(std::vector<Point_3>& points, std::size_t iterations) {
@@ -601,6 +693,53 @@ private:
       Point_3 mirrored_center = p - vlos;
 
       walk_los(p, center, mirrored_center, hint, i, nb_samples);
+    }
+  }
+
+  double l(double v, double mi, double ma) {
+    v -= mi;
+    return (std::min)(v, ma) / ma;
+  }
+
+  void dump_features(const std::string& filename, bool normalize) {
+    double mi = 1000, ma = -mi;
+    if (normalize)
+      for (int i = 0; i < m_points.size(); i++) {
+        if (m_eigen_values[i][0] != m_eigen_values[i][0] || m_eigen_values[i][1] != m_eigen_values[i][1] || m_eigen_values[i][2] != m_eigen_values[i][2])
+          continue;
+        for (int j = 0; j < 3; j++) {
+          mi = (std::min)(mi, m_eigen_values[i][j]);
+          ma = (std::max)(ma, m_eigen_values[i][j]);
+        }
+        assert(m_eigen_values[i][0] >= m_eigen_values[i][1]);
+        assert(m_eigen_values[i][1] >= m_eigen_values[i][2]);
+      }
+
+    std::ofstream ofile(filename);
+    ofile << std::setprecision(17);
+    ofile << "ply" << std::endl <<
+      "format ascii 1.0" << std::endl <<
+      "element vertex " << m_points.size() << std::endl <<
+      "comment " << mi << " " << ma << std::endl <<
+      "property double x" << std::endl <<
+      "property double y" << std::endl <<
+      "property double z" << std::endl <<
+      "property uchar red" << std::endl <<
+      "property uchar green" << std::endl <<
+      "property uchar blue" << std::endl <<
+      "end_header" << std::endl;
+
+    ma += mi;
+    if (ma > 20)
+      ma = 20;
+
+    for (int i = 0;i<m_points.size();i++) {
+      ofile << get(m_point_map, i);
+
+      if (normalize)
+        ofile << " " << int(l(m_eigen_values[i][0], mi, ma) * 255.0 + 0.5) << " " << int(l(m_eigen_values[i][1], mi, ma) * 255.0 + 0.5) << " " << int(l(m_eigen_values[i][2], mi, ma) * 255.0 + 0.5) << "\n";
+      else
+        ofile << " " << int(l(m_eigen_values[i][0], 0, 1.0) * 255.0 + 0.5) << " " << int(l(m_eigen_values[i][1], 0, 1.0) * 255.0 + 0.5) << " " << int(l(m_eigen_values[i][2], 0, 1.0) * 255.0 + 0.5) << "\n";
     }
   }
 

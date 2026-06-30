@@ -25,8 +25,8 @@ int main() {
   timer.start();
   Point_set ps;
 
-  //std::ifstream ifile("C:/dev/sparkling-wasure/datas/lidar_hd_crop_1/LHD_FXX_0635_6857_PTS_C_LAMB93_IGN69.copc.crop.laz", std::ios::binary);
-  std::ifstream ifile("C:/dev/sparkling-wasure/datas/lidar_hd_crop_2/Semis_2021_0912_6457_LA93_IGN69.las", std::ios::binary);
+  std::ifstream ifile("C:/dev/sparkling-wasure/datas/lidar_hd_crop_1/LHD_FXX_0635_6857_PTS_C_LAMB93_IGN69.copc.crop.laz", std::ios::binary);
+  //std::ifstream ifile("C:/dev/sparkling-wasure/datas/lidar_hd_crop_2/Semis_2021_0912_6457_LA93_IGN69.las", std::ios::binary);
   CGAL::IO::read_LAS(ifile, ps);
 
   //std::string filename = CGAL::data_file_path("points_3/building.ply");
@@ -42,7 +42,7 @@ int main() {
 
   Wasure wasure(ps);
 
-  wasure.compute_features();
+  wasure.compute_features_svd();
 
   timer.stop();
   std::cout << "Computing PCAs: " << timer.time() << " seconds." << std::endl;
