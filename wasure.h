@@ -182,7 +182,7 @@ public:
         ev[2] = eigen_values[2] / sum;
 
         for (int i = 0; i < 3; i++)
-          cur_entropy += -ev[0] * log(ev[0]);
+          cur_entropy += -ev[i] * log(ev[i]);
 
         if (cur_entropy < entropy) {
           entropy = cur_entropy;
@@ -206,7 +206,7 @@ public:
       assert(np * ev > 0);
     }
 
-    dump_features("out_sig.ply", true);
+    //dump_features("out_sig.ply", true);
   }
 
   template<typename Concurrency_tag = Sequential_tag, typename DiagonalizeTraits = CGAL::Default_diagonalize_traits<double, 3>>
@@ -220,6 +220,7 @@ public:
 
     for (auto idx : m_points) {
       double entropy = 1000000000;
+
       pts.clear();
       std::array<float, 3> sum = { 0, 0, 0 };
       Neighbor_search search(*m_tree_ptr, get(m_point_map, idx), 150, 0, true, m_dist);
@@ -234,8 +235,8 @@ public:
         sum[1] += pts.back().y();
         sum[2] += pts.back().z();
 
-        //if (k < 10)
-        //  continue;
+        if (k < 10)
+          continue;
 
         if (it->second < 0.02 && k < 30)
           continue;
@@ -243,7 +244,7 @@ public:
         std::array<FT, 3> singular_values;
         std::array<Vector_3, 3> eigen_vectors;
 
-        svd(mat, sum, singular_values, eigen_vectors);
+        svd(mat.topRows(k), singular_values, eigen_vectors);
 
         double cur_entropy = 0;
 
@@ -256,7 +257,7 @@ public:
         ev[2] = singular_values[2] / sum;
 
         for (int i = 0; i < 3; i++)
-          cur_entropy += -ev[0] * log(ev[0]);
+          cur_entropy += -ev[i] * log(ev[i]);
 
         if (cur_entropy < entropy) {
           entropy = cur_entropy;
@@ -280,7 +281,7 @@ public:
       assert(np * ev > 0);
     }
 
-    dump_features("out_sig_svd.ply", true);
+    //dump_features("out_sig_svd.ply", true);
   }
 
   void compute_mass_function(std::uint32_t num_samples = 40) {
@@ -346,7 +347,7 @@ public:
 
     dump_mass_function("mf_after_local.ply");
 
-    if (false && m_has_los) {
+    if (m_has_los) {
       compute_origin_mass();
       dump_mass_function("mf_after_origin.ply");
       penalize_flight_path();
@@ -398,9 +399,26 @@ public:
       m_cost_matrix[l].resize(m_tets.size());
 
     for (int id = 0; id < m_tets.size(); id++) {
-      if (m_triangulation.is_infinite(m_tets[id])) {
-        for (std::size_t l = 0; l < label_values.size(); l++)
-          m_cost_matrix[l][id] = (l == 0) ? 0 : 1000;
+      int ind_inf;
+      if (m_tets[id]->has_vertex(m_triangulation.infinite_vertex(), ind_inf)) {
+        auto tri = m_triangulation.triangle(m_tets[id], ind_inf);
+        Vector_3 n = CGAL::cross_product(tri[1] - tri[0], tri[2] - tri[0]);
+        FT l = CGAL::sqrt(n.squared_length());
+        n = n / l;
+
+        if (n.z() < -0.707) {
+          m_cost_matrix[0][id] = 1000;
+          m_cost_matrix[1][id] = 0;
+        }
+        else if (n.z() > 0.707) {
+          m_cost_matrix[0][id] = 0;
+          m_cost_matrix[1][id] = 1000;
+        }
+        else {
+          m_cost_matrix[0][id] = 0;
+          m_cost_matrix[1][id] = 0;
+        }
+
         continue;
       }
 
@@ -448,6 +466,13 @@ public:
     return m_triangulation.number_of_vertices();
     //m_triangulation.clear();
     //m_triangulation.insert(points.begin(), points.end());
+  }
+
+  template<typename PointRange>
+  std::size_t set_triangulation(PointRange points) {
+    m_triangulation.clear();
+    m_triangulation.insert(points.begin(), points.end());
+    return m_triangulation.number_of_vertices();
   }
 
   void simplify(FT density) {
@@ -508,15 +533,16 @@ private:
     eigen_vectors[2] = Vector_3(evectors[0], evectors[1], evectors[2]);
   }
 
-  void svd(Eigen::MatrixXf &mat, const std::array<float, 3> &sum, std::array<double, 3> &sv, std::array<Vector_3, 3> &ev) {
+  template<typename Block>
+  void svd(const Block &mat, std::array<double, 3> &sv, std::array<Vector_3, 3> &ev) {
     Eigen::MatrixXf m = mat.rowwise() - mat.colwise().mean();
     Eigen::JacobiSVD<Eigen::MatrixXf> svd(m, Eigen::ComputeThinU | Eigen::ComputeThinV);
     Eigen::MatrixXf svm = svd.singularValues();
     Eigen::MatrixXf evm = svd.matrixV();
 
-    ev[0] = Vector_3(evm(0, 0), evm(0, 1), evm(0, 2));
-    ev[1] = Vector_3(evm(1, 0), evm(1, 1), evm(1, 2));
-    ev[2] = Vector_3(evm(2, 0), evm(2, 1), evm(2, 2));
+    ev[0] = Vector_3(evm(0, 0), evm(1, 0), evm(2, 0));
+    ev[1] = Vector_3(evm(0, 1), evm(1, 1), evm(2, 1));
+    ev[2] = Vector_3(evm(0, 2), evm(1, 2), evm(2, 2));
 
     double v_min = 0.0000001;
     sv[0] = (svm(0) < v_min || std::isnan(svm(0))) ? v_min : svm(0);
