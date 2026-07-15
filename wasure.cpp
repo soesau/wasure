@@ -20,14 +20,35 @@ using Vector_3 = K::Vector_3;
 using Point_set = CGAL::Point_set_3<Point_3, Vector_3>;
 using Wasure = CGAL::Wasure<Point_set>;
 
+void read_indexed_ref(const std::string &filename, Point_set &ps) {
+  std::ifstream baryfile(filename);
+  std::string line;
+  std::istringstream iss;
+  while (std::getline(baryfile, line)) {
+    iss.clear();
+    iss.str(line);
+    unsigned int idx;
+    double x, y, z;
+    if (!(iss >> idx >> x >> y >> z)) { break; } // error
+    while (ps.size() < idx) ps.insert(Point_3(100000000, 100000000, 100000000));
+    ps.insert(Point_3(x, y, z));
+  }
+}
+
 int main() {
   CGAL::Real_timer timer;
   timer.start();
-  Point_set ps;
+  Point_set ps, bary, tri_mass;
+  std::vector<Point_3> dt_points;
+  CGAL::get_default_random() = CGAL::Random(1518508913);
 
   std::ifstream ifile("C:/dev/sparkling-wasure/datas/lidar_hd_crop_1/LHD_FXX_0635_6857_PTS_C_LAMB93_IGN69.copc.crop.laz", std::ios::binary);
   //std::ifstream ifile("C:/dev/sparkling-wasure/datas/lidar_hd_crop_2/Semis_2021_0912_6457_LA93_IGN69.las", std::ios::binary);
   CGAL::IO::read_LAS(ifile, ps);
+  CGAL::IO::read_XYZ("outputs0_details.xyz", std::back_inserter(dt_points));
+
+  read_indexed_ref("outputs0_lid_bary.xyz", bary);
+  read_indexed_ref("outputs0_dst_tri_10k.xyz", tri_mass);
 
   //std::string filename = CGAL::data_file_path("points_3/building.ply");
   //std::string filename = CGAL::data_file_path("points_3/chair.xyz");
@@ -42,19 +63,21 @@ int main() {
 
   Wasure wasure(ps);
 
-  wasure.compute_features_svd();
+  wasure.compute_features_svd<CGAL::Parallel_tag>();
 
   timer.stop();
   std::cout << "Computing PCAs: " << timer.time() << " seconds." << std::endl;
   timer.reset(); timer.start();
 
-  std::size_t nov = wasure.adaptive_triangulation(0.05);
+  //std::size_t nov = wasure.adaptive_triangulation(0.05);
+  std::size_t nov = wasure.set_triangulation(dt_points);
 
   timer.stop();
   std::cout << "Adaptive Delaunay triangulation " << timer.time() << " seconds. " << nov << " vertices in triangulation." << std::endl;
   timer.reset(); timer.start();
 
-  wasure.compute_mass_function();
+  wasure.compute_mass_function(40, bary, tri_mass);
+  //wasure.compute_mass_function();
 
   timer.stop();
   std::cout << "Computing weights: " << timer.time() << " seconds." << std::endl;

@@ -91,49 +91,58 @@ private:
   std::vector<std::array<double, 3>> m_mass_function; // empty, occupied, unknown
   std::vector<double> m_tet_volumes;
 
+  std::vector<std::array<double, 3>> m_dst_ref;
+  std::vector<int> m_bary_indices;
+  std::vector<int> m_observing;
+
   bool m_has_los;
 
 public:
   template<typename Concurrency_tag = Sequential_tag>
   Wasure(Point_set&points)
     : m_points(points), m_point_map(points.point_map()), m_dist(points.point_map()),
-      m_bbox(CGAL::bbox_3(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map)))
-  {
+      m_bbox(CGAL::bbox_3(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map))) {
+    std::cout << std::setprecision(17) << "Bounding box min: " << m_bbox.xmin() << " " << m_bbox.ymin() << " " << m_bbox.zmin() << std::endl;
+
     points.collect_garbage();
-    for (auto idx : m_points) {
-      Point_3 &p = get(m_point_map, idx);
-      p = Point_3(p.x() - m_bbox.xmin(), p.y() - m_bbox.ymin(), p.z() - m_bbox.zmin());
-    }
-    m_tree_ptr.reset(new Tree(m_points.begin(), m_points.end(), Tree::Splitter(), Search_traits(m_points.point_map())));
+
     CGAL_assertion(!points.has_garbage());
     if (!points.has_normal_map()) {
       std::optional<Scan_angle_map> scan_angle_map = m_points.property_map<float>("scan_angle");
       std::optional<Scan_ID_map> scan_id_map = m_points.property_map<unsigned char>("scan_direction_flag");
       std::optional<Point_source_ID_map> point_source_id_map = m_points.property_map<unsigned short>("point_source_ID");
-      //std::optional<
+      points.add_normal_map();
       CGAL_assertion(scan_angle_map.has_value() && (scan_id_map.has_value() || point_source_id_map.has_value()));
       m_los = m_points.add_property_map<Vector_3>("los").first;
       m_has_los = true;
       //CGAL::jet_estimate_normals<Concurrency_tag>(m_points, 100, CGAL::parameters::point_map(m_point_map).normal_map(m_normal_map));
-      if (scan_id_map.has_value())
-        CGAL::scanline_orient_normals(m_points,
-          CGAL::parameters::point_map(m_points.point_map()).
-          normal_map(m_los).
-          scan_angle_map(scan_angle_map.value()).
-          scanline_id_map(scan_id_map.value()));
-      else
-        CGAL::scanline_orient_normals(m_points,
-          CGAL::parameters::point_map(m_points.point_map()).
-          normal_map(m_los).
+//       if (scan_id_map.has_value())
+//         CGAL::scanline_orient_normals(m_points,
+//           CGAL::parameters::point_map(m_points.point_map()).
+//           normal_map(m_los).
+//           scan_angle_map(scan_angle_map.value()).
+//           scanline_id_map(scan_id_map.value()));
+//       else
+        CGAL::scanline_orient_normals(points,
+          CGAL::parameters::point_map(points.point_map()).
+          normal_map(points.normal_map()).
           scan_angle_map(scan_angle_map.value()).
           scanline_id_map(point_source_id_map.value()));
 
+        //dump_los("los_raw.ply", points, points.normal_map());
+
+
       for (auto idx : m_points) {
-        Vector_3 &v = get(m_los, idx);
-        v = Vector_3(v.x() * 200.0, v.y() * 200.0, v.z() * 200.0);
+        Point_3& p = get(m_point_map, idx);
+        p = Point_3(p.x() - 635471.0, p.y() - 6856430.0, p.z() - 134.77);
+        Vector_3 v = get(points.normal_map(), idx);
+        v = Vector_3(p.x() + v.x() * 200.0, p.y() + v.y() * 200.0, p.z() + v.z() * 200.0);
+        put(m_los, idx, v);
       }
 
-      dump_los("los.ply");
+      m_tree_ptr.reset(new Tree(m_points.begin(), m_points.end(), Tree::Splitter(), Search_traits(m_points.point_map())));
+
+      //dump_los("los.ply", m_points, m_los);
     }
     else m_has_los = false;
   }
@@ -195,31 +204,22 @@ public:
 
     orient_features();
 
-    Normal_map normal_map = m_points.normal_map();
-    for (auto idx : m_points) {
-      Point_3 p = get(m_point_map, idx);
-      Vector_3 n = get(normal_map, idx);
-      Vector_3 np = Vector_3(p.x(), p.y(), p.z());
-      assert(n * np > 0);
-      Vector_3 ev = m_eigen_vectors[idx][2];
-      assert(n * ev > 0);
-      assert(np * ev > 0);
-    }
-
     //dump_features("out_sig.ply", true);
   }
 
   template<typename Concurrency_tag = Sequential_tag, typename DiagonalizeTraits = CGAL::Default_diagonalize_traits<double, 3>>
   void compute_features_svd() {
-    std::vector<Point_3> pts;
-    pts.reserve(150);
-    Eigen::MatrixXf mat(150, 3);
 
     m_eigen_values.resize(m_points.size());
     m_eigen_vectors.resize(m_points.size());
 
-    for (auto idx : m_points) {
+    m_tree_ptr->build();
+
+    auto compute = [this](typename Point_set::Index idx) {
       double entropy = 1000000000;
+      std::vector<Point_3> pts;
+      pts.reserve(150);
+      Eigen::MatrixXf mat(150, 3);
 
       pts.clear();
       std::array<float, 3> sum = { 0, 0, 0 };
@@ -227,7 +227,7 @@ public:
       int k = 0;
       for (typename Neighbor_search::iterator it = search.begin(); it != search.end(); ++it) {
         pts.push_back(get(m_point_map, it->first));
-        const Point_3 &p = get(m_point_map, it->first);
+        const Point_3& p = get(m_point_map, it->first);
         mat.row(k) << p.x(), p.y(), p.z();
         k++;
 
@@ -266,35 +266,40 @@ public:
         }
       }
       assert(entropy != 1000000000);
+    };
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_same_v<Concurrency_tag, Parallel_tag>) {
+      tbb::parallel_for_each(m_points, compute);
+    }
+    else
+#endif
+    for (auto idx : m_points) {
+      compute(idx);
     }
 
     orient_features();
 
-    Normal_map normal_map = m_points.normal_map();
-    for (auto idx : m_points) {
-      Point_3 p = get(m_point_map, idx);
-      Vector_3 n = get(normal_map, idx);
-      Vector_3 np = Vector_3(p.x(), p.y(), p.z());
-      assert(n * np > 0);
-      Vector_3 ev = m_eigen_vectors[idx][2];
-      assert(n * ev > 0);
-      assert(np * ev > 0);
-    }
-
-    //dump_features("out_sig_svd.ply", true);
+    dump_features("out_sig_svd.ply", true);
+    dump_vectors("out_ev_0_svd.ply", m_eigen_vectors, 0);
+    dump_vectors("out_ev_1_svd.ply", m_eigen_vectors, 1);
+    dump_vectors("out_ev_2_svd.ply", m_eigen_vectors, 2);
   }
 
-  void compute_mass_function(std::uint32_t num_samples = 40) {
+  void compute_mass_function(std::uint32_t num_samples = 40, Point_set bary_lookup = Point_set(), Point_set dst_ref = Point_set()) {
     if (m_triangulation.number_of_vertices() == 0)
       m_triangulation.insert(CGAL::make_transform_iterator_from_property_map(m_points.begin(), m_point_map), CGAL::make_transform_iterator_from_property_map(m_points.end(), m_point_map));
 
     m_tets.clear();
     m_tets.reserve(m_triangulation.number_of_cells() + 1);
     m_tet_indices[m_triangulation.infinite_cell()] = m_tets.size() - 1;
+
     for (auto it = m_triangulation.cells_begin(); it != m_triangulation.cells_end(); ++it) {
       m_tets.push_back(it);
       m_tet_indices[it] = m_tets.size() - 1;
     }
+
+    if (!bary_lookup.empty() && !dst_ref.empty())
+      add_dst_reference(bary_lookup, dst_ref);
 
     m_edges.clear();
     m_edges.reserve(m_triangulation.number_of_facets());
@@ -319,6 +324,12 @@ public:
     m_mass_function.resize(m_tets.size(), std::array<double, 3>{0, 0, 0});
     m_tet_volumes.resize(m_tets.size(), 0);
 
+
+//     for (int i : m_observing) {
+    //compute_local_mass(m_tets[5133], m_mass_function[5133], num_samples, false);
+    //std::cout << "tet " << 5133 << " mass function: " << m_mass_function[5133][0] << " " << m_mass_function[5133][1] << " " << m_mass_function[5133][2] << std::endl;
+//     }
+
     for (int id = 0; id < m_tets.size();id++) {
       if (m_triangulation.is_infinite(m_tets[id])) {
         m_mass_function[id] = { 1, 0, 0 };
@@ -329,6 +340,19 @@ public:
       tet_weight_sum += m_tet_volumes[id];
 
       compute_local_mass(m_tets[id], m_mass_function[id], num_samples);
+
+      //Use weights directly from distributed Wasure
+      //m_mass_function[id] = m_dst_ref[id];
+
+      /*if (!bary_lookup.empty() && !dst_ref.empty()) {
+        std::size_t idx = m_bary_indices[id];
+
+        const float tol = 0.1;
+
+        if ((abs(m_mass_function[id][0] - m_dst_ref[id][0]) > tol) || (abs(m_mass_function[id][1] - m_dst_ref[id][1]) > tol) || (abs(m_mass_function[id][2] - m_dst_ref[id][2]) > tol)) {
+            std::cout << "tet " << id << " " << idx << " mass function differs from reference: " << m_mass_function[id][0] << " " << m_mass_function[id][1] << " " << m_mass_function[id][2] << " vs. " << m_dst_ref[id][0] << " " << m_dst_ref[id][1] << " " << m_dst_ref[id][2] << std::endl;
+        }
+      }*/
 
       double sum = m_mass_function[id][0] + m_mass_function[id][1] + m_mass_function[id][2];
       if (sum < 0.99 || sum > 1.01)
@@ -472,6 +496,7 @@ public:
   std::size_t set_triangulation(PointRange points) {
     m_triangulation.clear();
     m_triangulation.insert(points.begin(), points.end());
+    std::cout << m_triangulation.number_of_cells() << " tets " << m_triangulation.number_of_finite_cells() << " finite tets, " << m_triangulation.number_of_vertices() << " vertices" << std::endl;
     return m_triangulation.number_of_vertices();
   }
 
@@ -503,6 +528,58 @@ public:
   }
 
 private:
+  void add_dst_reference(Point_set& bary_lookup, Point_set& dst_ref) {
+    assert(!m_triangulation.number_of_vertices() == 0);
+    Tree bary(bary_lookup.begin(), bary_lookup.end(), Tree::Splitter(), Search_traits(bary_lookup.point_map()));
+
+    int too_far = 0;
+    m_bary_indices.clear();
+    m_bary_indices.resize(m_tets.size(), -1);
+    m_dst_ref.clear();
+    m_dst_ref.reserve(m_tets.size());
+    for (int i = 0; i < m_tets.size(); i++) {
+      Cell_handle ch = m_tets[i];
+
+      if (m_triangulation.is_infinite(ch))
+        continue;
+
+      Point_3 b = CGAL::centroid(ch->vertex(0)->point(), ch->vertex(1)->point(), ch->vertex(2)->point(), ch->vertex(3)->point());
+      Neighbor_search search(bary, b, 1, 0, true, Distance(bary_lookup.point_map()));
+      auto it = search.begin();
+      if (it == search.end())
+        std::cout << "could not match tet" << std::endl;
+      if (it->second > 0.001) {
+        //std::cout << "dist too high " << i << std::endl;
+        too_far++;
+      }
+      m_bary_indices[i] = it->first;
+      Point_3 r = get(dst_ref.point_map(), it->first);
+      double sum = r.x() + r.y() + r.z();
+      m_dst_ref[i] = { r.x() / sum, r.y() / sum, r.z() / sum };
+    }
+    std::cout << too_far << " tets too far from reference" << std::endl;
+
+    // neighbors of outside tet
+
+    /*std::ofstream ofile("outside_tets.xyz");
+
+    Neighbor_search search(bary, Point_3(58.70454788, 16.55340958, 23.91974449), 5, 0, true, Distance(bary_lookup.point_map()));
+    std::cout << "neighbors of outside tet: " << std::endl;
+    for (auto it = search.begin(); it != search.end(); ++it) {
+      Point_3 r = get(dst_ref.point_map(), it->first);
+      std::cout << it->first << " dist: " << it->second << " weights: " << r.x() << " " << r.y() << " " << r.z() << std::endl;
+      for (int i = 0; i < m_bary_indices.size(); i++)
+        if (int(it->first) == m_bary_indices[i]) {
+          std::cout << i << " found in bary indices" << std::endl;
+          m_observing.push_back(i);
+
+          Cell_handle ch = m_tets[i];
+          Point_3 b = CGAL::centroid(ch->vertex(0)->point(), ch->vertex(1)->point(), ch->vertex(2)->point(), ch->vertex(3)->point());
+          ofile << b << std::endl;
+        }
+    }*/
+  }
+
   template<typename DiagonalizeTraits>
   void pca(const std::vector<Point_3> &pts, const Point_3 &mean, std::array<double, 3> &eigen_values, std::array<Vector_3, 3> &eigen_vectors) {
     std::array<double, 6> covariance = make_array(.0, .0, .0, .0, .0, .0);
@@ -534,7 +611,7 @@ private:
   }
 
   template<typename Block>
-  void svd(const Block &mat, std::array<double, 3> &sv, std::array<Vector_3, 3> &ev) {
+  static void svd(const Block &mat, std::array<double, 3> &sv, std::array<Vector_3, 3> &ev) {
     Eigen::MatrixXf m = mat.rowwise() - mat.colwise().mean();
     Eigen::JacobiSVD<Eigen::MatrixXf> svd(m, Eigen::ComputeThinU | Eigen::ComputeThinV);
     Eigen::MatrixXf svm = svd.singularValues();
@@ -665,7 +742,7 @@ private:
     }
   }
 
-  void compute_local_mass(Cell_handle ch, std::array<FT, 3> &mass, std::uint32_t nb_samples) {
+  void compute_local_mass(Cell_handle ch, std::array<FT, 3> &mass, std::uint32_t nb_samples, bool log = false) {
     Point_generator pg(m_triangulation.tetrahedron(ch));
     for (std::uint32_t i = 0; i < nb_samples; ++i) {
       Point_3 s;
@@ -679,16 +756,44 @@ private:
       std::array<double, 3> sample_mass = { 0, 0, 1 };
       for (typename Neighbor_search::iterator it = search.begin(); it != search.end(); ++it) {
         Point_3 p = get(m_point_map, it->first);
+        if (log)
+          std::cout << p << std::endl;
         double largest_ev = m_eigen_values[it->first][0];
+        if (log)
+          std::cout << largest_ev << std::endl;
+
+        if (log) {
+        Vector_3 ori = get(m_los, it->first);
+        std::cout << "ori: " << ori.x() << " " << ori.y() << " " << ori.z() << std::endl;
+        Point_3 los = p + ori;
+        std::cout << "los: " << los.x() << " " << los.y() << " " << los.z() << std::endl;
+        }
+
         std::array<double, 3> point_mass = { 0, 0, 0 };
+        if (log)
+          std::cout << it->first << std::endl;
+        if (log)
+          std::cout << "evs: " << m_eigen_vectors[it->first][0] << " - " << m_eigen_vectors[it->first][1] << " - " << m_eigen_vectors[it->first][2] << std::endl;
         std::array<double, 3> point_coefficients = calculate_point_coefficients(p, s, m_eigen_vectors[it->first]);
-        compute_dst_local_sample(point_coefficients, m_eigen_values[it->first], 1.0, largest_ev, largest_ev, point_mass);
+        if (log)
+          std::cout << point_coefficients[0] << " " << point_coefficients[1] << " " << point_coefficients[2] << std::endl;
+        compute_dst_local_sample(point_coefficients, m_eigen_values[it->first], 1.0, largest_ev, largest_ev, point_mass, log);
+        if (log)
+          std::cout << point_mass[0] << " " << point_mass[1] << " " << point_mass[2] << std::endl;
+        if (log)
+          std::cout << sample_mass[0] << " " << sample_mass[1] << " " << sample_mass[2] << std::endl;
         ds_score(sample_mass, point_mass, sample_mass);
+        if (log)
+          std::cout << sample_mass[0] << " " << sample_mass[1] << " " << sample_mass[2] << std::endl;
         regularize(sample_mass);
+        if (log)
+          std::cout << sample_mass[0] << " " << sample_mass[1] << " " << sample_mass[2] << std::endl;
       }
       mass[0] += sample_mass[0];
       mass[1] += sample_mass[1];
       mass[2] += sample_mass[2];
+      if (log)
+        std::cout << mass[0] << " " << mass[1] << " " << mass[2] << std::endl;
     }
 
     CGAL_assertion(!std::isnan(mass[0]));
@@ -698,6 +803,8 @@ private:
     mass[0] /= nb_samples;
     mass[1] /= nb_samples;
     mass[2] /= nb_samples;
+    if (log)
+      std::cout << mass[0] << " " << mass[1] << " " << mass[2] << std::endl;
   }
 
   void compute_origin_mass(std::uint32_t nb_samples = 40, unsigned int ratio = 0) {
@@ -791,11 +898,8 @@ private:
     }
   }
 
-  void dump_los(const std::string& filename) {
-    if (!m_has_los) {
-      std::cout << "dump_los called without having line of sight data" << std::endl;
-      return;
-    }
+  void dump_vectors(const std::string& filename, std::vector<std::array<Vector_3, 3>> &ev, int i) {
+
     std::ofstream ofile(filename);
     ofile << std::setprecision(17);
     ofile << "ply" << std::endl <<
@@ -811,7 +915,33 @@ private:
 
     for (auto idx : m_points) {
       ofile << get(m_point_map, idx);
-      Vector_3 los = get(m_los, idx);
+      if (std::isnan(ev[idx][i].x()) || std::isnan(ev[idx][i].y()) || std::isnan(ev[idx][i].z()))
+        ofile << " 0 0 0\n";
+      else ofile << " " << ev[idx][i] << "\n";
+    }
+  }
+
+  void dump_los(const std::string& filename, const Point_set &ps, Vector_map nmap) {
+    if (!m_has_los) {
+      std::cout << "dump_los called without having line of sight data" << std::endl;
+      return;
+    }
+    std::ofstream ofile(filename);
+    ofile << std::setprecision(17);
+    ofile << "ply" << std::endl <<
+      "format ascii 1.0" << std::endl <<
+      "element vertex " << ps.size() << std::endl <<
+      "property double x" << std::endl <<
+      "property double y" << std::endl <<
+      "property double z" << std::endl <<
+      "property double nx" << std::endl <<
+      "property double ny" << std::endl <<
+      "property double nz" << std::endl <<
+      "end_header" << std::endl;
+
+    for (auto idx : ps) {
+      ofile << get(ps.point_map(), idx);
+      Vector_3 los = get(nmap, idx);
       if (std::isnan(los.x()) || std::isnan(los.y()) || std::isnan(los.z()))
         ofile << " 0 0 0\n";
       else ofile << " " << los << "\n";
@@ -845,18 +975,30 @@ private:
   }
 
   void orient_features() {
-    Vector_map ref = (m_has_los) ? m_los : m_normal_map;
-    for (auto idx : m_points) {
-      Vector_3 normal = get(ref, idx);
-      if (normal * m_eigen_vectors[idx][2] < 0)
-        m_eigen_vectors[idx][2] = -m_eigen_vectors[idx][2];
+    if (m_has_los) {
+      for (auto idx : m_points) {
+        Point_3 p = get(m_point_map, idx);
+        Vector_3 c = get(m_los, idx);
+        std::array<double, 3> point_coefficients = calculate_point_coefficients(p, Point_3(c.x(), c.y(), c.z()), m_eigen_vectors[idx]);
+        if (point_coefficients[2] < 0)
+          m_eigen_vectors[idx][2] = -m_eigen_vectors[idx][2];
+      }
+    }
+    else {
+      for (auto idx : m_points) {
+        Vector_3 normal = get(m_normal_map, idx);
+        if (normal * m_eigen_vectors[idx][2] < 0)
+          m_eigen_vectors[idx][2] = -m_eigen_vectors[idx][2];
+      }
     }
   }
 
-  void compute_dst_local_sample(const std::array<double, 3> &pcoeff, const std::array<double, 3> &eigen_values, double coef_conf, double pdfs_e, double pdfs_o, std::array<double, 3> &mass) {
+  void compute_dst_local_sample(const std::array<double, 3> &pcoeff, const std::array<double, 3> &eigen_values, double coef_conf, double pdfs_e, double pdfs_o, std::array<double, 3> &mass, bool log = false) {
+    if (log)
+      std::cout << "cc: " << coef_conf << " " << pdfs_e << " " << pdfs_o << " ev: " << eigen_values[0] << " " << eigen_values[1] << " " << eigen_values[2] << std::endl;
     double nscale = eigen_values[2];
-    if (nscale <= 0.00001)
-      nscale = 0.00001;
+    if (nscale <= 0.000001)
+      nscale = 0.000001;
 
     // Is sample point in front of the surface point?
     if (pcoeff[2] > 0) {
@@ -869,7 +1011,7 @@ private:
     }
     else mass[0] = mass[1] = 0.5;
 
-    for (int i = 0;i<3;i++)
+    for (int i = 0;i<2;i++)
       if (eigen_values[i] <= 0)
         mass[0] = mass[1] = 0;
       else {
@@ -878,12 +1020,19 @@ private:
         mass[1] *= score_pdf;
       }
 
+    if (log)
+      std::cout << "m: " << mass[0] << " " << mass[1] << std::endl;
+
     mass[0] = mass[0] * exp(-(fabs(pcoeff[2]) / (pdfs_e)) * (fabs(pcoeff[2]) / (pdfs_e)));
     mass[1] = mass[1] * exp(-(fabs(pcoeff[2]) / (pdfs_o)) * (fabs(pcoeff[2]) / (pdfs_o)));
     mass[0] = mass[0] * coef_conf;
     mass[1] = mass[1] * coef_conf;
+    if (log)
+      std::cout << "m: " << mass[0] << " " << mass[1] << std::endl;
 
     regularize(mass);
+    if (log)
+      std::cout << "m: " << mass[0] << " " << mass[1] << std::endl;
   }
 
   void compute_dst_los_samples(const Cell_handle &ch, const Point_3 &p, const Point_3& center, std::size_t pidx, std::uint32_t nb_samples) {
